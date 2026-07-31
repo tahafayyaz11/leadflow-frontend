@@ -2,6 +2,9 @@ import { useState, useRef, useEffect } from 'react'
 import { GoogleMap, Marker, InfoWindow, useJsApiLoader } from '@react-google-maps/api'
 import * as XLSX from 'xlsx'
 import { supabase } from '../lib/supabase'
+import jsPDF from 'jspdf'
+import autoTable from 'jspdf-autotable'
+import Logo from './Logo'
 
 const GOOGLE_MAPS_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY
 const API_URL = import.meta.env.VITE_API_URL
@@ -16,7 +19,7 @@ const MAX_HISTORY = 10
 const defaultCenter = { lat: 30.2672, lng: -97.7431 }
 
 function SearchScreen({ user }) {
-  const [view, setView] = useState('search') // 'search' | 'history'
+  const [view, setView] = useState('search')
   const [niche, setNiche] = useState('')
   const [location, setLocation] = useState('')
   const [selectedSources, setSelectedSources] = useState(['Google'])
@@ -32,6 +35,14 @@ function SearchScreen({ user }) {
   const [pastSearches, setPastSearches] = useState([])
   const [showProfileMenu, setShowProfileMenu] = useState(false)
   const geocoderRef = useRef(null)
+  const [favoriteIds, setFavoriteIds] = useState(new Set())
+  const [favoritesList, setFavoritesList] = useState([])
+
+  const [draftModalLead, setDraftModalLead] = useState(null)
+  const [draftText, setDraftText] = useState('')
+  const [draftLoading, setDraftLoading] = useState(false)
+  const [draftError, setDraftError] = useState('')
+  const [copied, setCopied] = useState(false)
 
   const { isLoaded } = useJsApiLoader({
     googleMapsApiKey: GOOGLE_MAPS_KEY,
@@ -39,6 +50,7 @@ function SearchScreen({ user }) {
 
   useEffect(() => {
     loadHistory()
+    loadFavorites()
   }, [user.id])
 
   const loadHistory = async () => {
@@ -53,6 +65,74 @@ function SearchScreen({ user }) {
     } else {
       console.error('Failed to load history:', error)
     }
+  }
+
+  const loadFavorites = async () => {
+    const { data, error } = await supabase
+      .from('favorites')
+      .select('business_name')
+      .eq('user_id', user.id)
+
+    if (!error) {
+      setFavoriteIds(new Set(data.map((f) => f.business_name)))
+    }
+  }
+
+  const loadFavoritesList = async () => {
+    const { data, error } = await supabase
+      .from('favorites')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+
+    if (!error) {
+      setFavoritesList(data)
+    }
+  }
+
+  const toggleFavorite = async (lead, e) => {
+    e.stopPropagation()
+
+    const isFavorited = favoriteIds.has(lead.business_name)
+
+    if (isFavorited) {
+      await supabase
+        .from('favorites')
+        .delete()
+        .eq('user_id', user.id)
+        .eq('business_name', lead.business_name)
+
+      setFavoriteIds((prev) => {
+        const next = new Set(prev)
+        next.delete(lead.business_name)
+        return next
+      })
+    } else {
+      await supabase.from('favorites').insert({
+        user_id: user.id,
+        business_name: lead.business_name,
+        address: lead.address || null,
+        phone: lead.phone || null,
+        website: lead.website || null,
+        category: lead.category || null,
+        score: lead.score || null,
+        score_reason: lead.score_reason || null,
+        source: lead.source || 'google',
+        facebook_url: lead.facebook_url || null,
+      })
+
+      setFavoriteIds((prev) => new Set(prev).add(lead.business_name))
+    }
+  }
+
+  const removeFavorite = async (fav) => {
+    await supabase.from('favorites').delete().eq('id', fav.id)
+    setFavoritesList((prev) => prev.filter((f) => f.id !== fav.id))
+    setFavoriteIds((prev) => {
+      const next = new Set(prev)
+      next.delete(fav.business_name)
+      return next
+    })
   }
 
   const enforceHistoryLimit = async () => {
@@ -98,6 +178,45 @@ function SearchScreen({ user }) {
         }
       })
     })
+  }
+
+  const openDraftModal = async (lead, e) => {
+    e.stopPropagation()
+    setDraftModalLead(lead)
+    setDraftText('')
+    setDraftError('')
+    setDraftLoading(true)
+
+    try {
+      const res = await fetch(`${API_URL}/draft-outreach`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(lead),
+      })
+      if (!res.ok) throw new Error('Failed to generate draft')
+      const data = await res.json()
+      setDraftText(data.draft)
+    } catch (err) {
+      setDraftError(err.message)
+    } finally {
+      setDraftLoading(false)
+    }
+  }
+
+  const regenerateDraft = () => {
+    openDraftModal(draftModalLead, { stopPropagation: () => {} })
+  }
+
+  const copyDraft = () => {
+    navigator.clipboard.writeText(draftText)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  const closeDraftModal = () => {
+    setDraftModalLead(null)
+    setDraftText('')
+    setDraftError('')
   }
 
   const handleLeadClick = (lead) => {
@@ -221,6 +340,17 @@ function SearchScreen({ user }) {
     window.location.reload()
   }
 
+  const handleSwitchAccount = async () => {
+    await supabase.auth.signOut()
+    await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: window.location.origin,
+        queryParams: { prompt: 'select_account' },
+      },
+    })
+  }
+
   const handleSearch = async (e) => {
     e.preventDefault()
     setError('')
@@ -298,6 +428,80 @@ function SearchScreen({ user }) {
     XLSX.writeFile(workbook, `${niche || 'leads'}-${location || 'search'}.xlsx`)
   }
 
+  const exportToPDF = () => {
+    const doc = new jsPDF()
+
+    doc.setFontSize(14)
+    doc.text(`Leads: ${niche || 'Search'} in ${location || ''}`, 14, 15)
+    doc.setFontSize(9)
+    doc.text(`Generated ${new Date().toLocaleDateString()} — ${filteredLeads.length} leads`, 14, 21)
+
+    autoTable(doc, {
+      startY: 26,
+      head: [['Business Name', 'Score', 'Reason', 'Address', 'Phone', 'Source']],
+      body: filteredLeads.map((lead) => [
+        lead.business_name || '',
+        lead.score || '',
+        lead.score_reason || '',
+        lead.address || '',
+        lead.phone || '',
+        lead.source || '',
+      ]),
+      styles: { fontSize: 8, cellPadding: 2 },
+      headStyles: { fillColor: [124, 58, 237] },
+      columnStyles: {
+        2: { cellWidth: 55 },
+      },
+    })
+
+    doc.save(`${niche || 'leads'}-${location || 'search'}.pdf`)
+  }
+
+  const exportFavoritesExcel = () => {
+    const exportData = favoritesList.map((lead) => ({
+      'Business Name': lead.business_name,
+      'Score': lead.score,
+      'Reason': lead.score_reason,
+      'Address': lead.address || '',
+      'Phone': lead.phone || '',
+      'Website': lead.website || '',
+      'Category': lead.category || '',
+      'Source': lead.source || '',
+    }))
+
+    const worksheet = XLSX.utils.json_to_sheet(exportData)
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Favorites')
+    XLSX.writeFile(workbook, 'favorite-leads.xlsx')
+  }
+
+  const exportFavoritesPDF = () => {
+    const doc = new jsPDF()
+
+    doc.setFontSize(14)
+    doc.text('Favorite Leads', 14, 15)
+    doc.setFontSize(9)
+    doc.text(`Generated ${new Date().toLocaleDateString()} — ${favoritesList.length} leads`, 14, 21)
+
+    autoTable(doc, {
+      startY: 26,
+      head: [['Business Name', 'Score', 'Reason', 'Address', 'Phone', 'Source']],
+      body: favoritesList.map((lead) => [
+        lead.business_name || '',
+        lead.score || '',
+        lead.score_reason || '',
+        lead.address || '',
+        lead.phone || '',
+        lead.source || '',
+      ]),
+      styles: { fontSize: 8, cellPadding: 2 },
+      headStyles: { fillColor: [124, 58, 237] },
+      columnStyles: { 2: { cellWidth: 55 } },
+    })
+
+    doc.save('favorite-leads.pdf')
+  }
+
   const scoreBadgeColor = (score) => {
     if (score === 'hot') return 'bg-red-500/20 text-red-400'
     if (score === 'warm') return 'bg-amber-500/20 text-amber-400'
@@ -315,10 +519,21 @@ function SearchScreen({ user }) {
     })
   }
 
+  const StarIcon = ({ filled }) => (
+    <svg
+      width="14" height="14" viewBox="0 0 24 24"
+      fill={filled ? '#facc15' : 'none'}
+      stroke={filled ? '#facc15' : 'currentColor'}
+      strokeWidth="2"
+    >
+      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+    </svg>
+  )
+
   // ---- HISTORY SCREEN ----
   if (view === 'history') {
     return (
-      <div className="h-screen bg-gray-900 flex flex-col">
+      <div className="h-screen bg-gray-900 flex flex-col page-transition">
         <div className="flex items-center justify-between px-6 py-5 border-b border-gray-800 flex-shrink-0">
           <div className="flex items-center gap-3">
             <button
@@ -378,13 +593,101 @@ function SearchScreen({ user }) {
     )
   }
 
+  // ---- FAVORITES SCREEN ----
+  if (view === 'favorites') {
+    return (
+      <div className="h-screen bg-gray-900 flex flex-col page-transition">
+        <div className="flex items-center justify-between px-6 py-5 border-b border-gray-800 flex-shrink-0">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setView('search')}
+              className="w-8 h-8 rounded-lg bg-gray-800 hover:bg-gray-700 flex items-center justify-center transition text-gray-300"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M19 12H5M12 19l-7-7 7-7" />
+              </svg>
+            </button>
+            <h1 className="text-white font-medium text-lg">Favorite Leads</h1>
+          </div>
+
+          {favoritesList.length > 0 && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={exportFavoritesExcel}
+                title="Export all to Excel"
+                className="w-8 h-8 rounded-lg bg-gray-800 hover:bg-gray-700 flex items-center justify-center text-green-400 transition"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <path d="M12 18v-6M9 15l3 3 3-3" />
+                </svg>
+              </button>
+              <button
+                onClick={exportFavoritesPDF}
+                title="Export all to PDF"
+                className="w-8 h-8 rounded-lg bg-gray-800 hover:bg-gray-700 flex items-center justify-center text-red-400 transition"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <path d="M9 15h1M9 12h1M14 12h1M14 15h1" />
+                </svg>
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          {favoritesList.length === 0 ? (
+            <div className="h-full flex items-center justify-center">
+              <p className="text-gray-500 text-sm">No favorite leads yet</p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2 max-w-2xl mx-auto">
+              {favoritesList.map((lead) => (
+                <div key={lead.id} className="bg-gray-800 rounded-xl p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-white text-sm font-medium truncate">{lead.business_name}</span>
+                        <span className={`text-xs px-2 py-0.5 rounded-full ${scoreBadgeColor(lead.score)}`}>
+                          {lead.score}
+                        </span>
+                        {lead.source === 'instagram' && (
+                          <span className="text-xs text-pink-400">Instagram</span>
+                        )}
+                        {lead.source === 'facebook' && (
+                          <span className="text-xs text-blue-400">Facebook</span>
+                        )}
+                      </div>
+                      <p className="text-gray-400 text-xs mt-1">{lead.score_reason}</p>
+                      {lead.address && <p className="text-gray-500 text-xs mt-1">{lead.address}</p>}
+                    </div>
+                    <button
+                      onClick={() => removeFavorite(lead)}
+                      title="Remove from favorites"
+                      className="flex-shrink-0"
+                    >
+                      <StarIcon filled />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   // ---- MAIN SEARCH SCREEN ----
   return (
-    <div className="h-screen bg-gray-900 flex overflow-hidden">
+    <div className="h-screen bg-gray-900 flex overflow-hidden page-transition">
       <div className="w-1/2 p-6 flex flex-col h-screen">
         <div className="flex items-center justify-between mb-6 flex-shrink-0 relative">
           <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-purple-600 to-purple-400" />
+            <Logo size={28} />
             <span className="text-white font-medium">Leadflow</span>
           </div>
 
@@ -422,10 +725,31 @@ function SearchScreen({ user }) {
                 </button>
 
                 <button
-                  onClick={handleSignOut}
+                  onClick={() => {
+                    setView('favorites')
+                    loadFavoritesList()
+                    setShowProfileMenu(false)
+                  }}
+                  className="w-full text-left px-4 py-2.5 text-sm text-gray-300 hover:bg-gray-700 transition flex items-center gap-2"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                  </svg>
+                  Favorite Leads
+                </button>
+
+                <button
+                  onClick={handleSwitchAccount}
                   className="w-full text-left px-4 py-2.5 text-sm text-gray-300 hover:bg-gray-700 transition border-t border-gray-700"
                 >
                   Switch account
+                </button>
+
+                <button
+                  onClick={handleSignOut}
+                  className="w-full text-left px-4 py-2.5 text-sm text-red-400 hover:bg-gray-700 transition"
+                >
+                  Log out
                 </button>
               </div>
             </>
@@ -513,13 +837,13 @@ function SearchScreen({ user }) {
                 >
                   <div className="text-gray-900 text-sm max-w-[220px]">
                     <p className="font-semibold mb-1">{selectedLead.business_name}</p>
-                    {selectedLead.phone && <p className="text-xs">📞 {selectedLead.phone}</p>}
+                    {selectedLead.phone && <p className="text-xs">Phone: {selectedLead.phone}</p>}
                     {selectedLead.website && (
                       <p className="text-xs truncate">
-                        🌐 <a href={selectedLead.website} target="_blank" rel="noreferrer">{selectedLead.website}</a>
+                        <a href={selectedLead.website} target="_blank" rel="noreferrer">{selectedLead.website}</a>
                       </p>
                     )}
-                    {selectedLead.category && <p className="text-xs">🏷️ {selectedLead.category}</p>}
+                    {selectedLead.category && <p className="text-xs">{selectedLead.category}</p>}
                     <p className="text-xs mt-1">{selectedLead.address}</p>
                   </div>
                 </InfoWindow>
@@ -568,6 +892,20 @@ function SearchScreen({ user }) {
                 </svg>
               </button>
             )}
+
+            {leads.length > 0 && (
+              <button
+                onClick={exportToPDF}
+                title="Export to PDF"
+                className="w-8 h-8 rounded-lg bg-gray-800 hover:bg-gray-700 flex items-center justify-center transition flex-shrink-0"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <path d="M9 15h1M9 12h1M14 12h1M14 15h1" />
+                </svg>
+              </button>
+            )}
           </div>
         </div>
 
@@ -599,20 +937,101 @@ function SearchScreen({ user }) {
                       {lead.score}
                     </span>
                     {lead.source === 'instagram' && (
-                      <span className="text-xs text-pink-400">📷 Instagram</span>
+                      <span className="text-xs text-pink-400">Instagram</span>
                     )}
                     {lead.source === 'facebook' && (
-                      <span className="text-xs text-blue-400">👤 Facebook</span>
+                      <span className="text-xs text-blue-400">Facebook</span>
                     )}
                   </div>
                   <p className="text-gray-400 text-xs mt-1">{lead.score_reason}</p>
                   {lead.address && <p className="text-gray-500 text-xs mt-1">{lead.address}</p>}
+
+                  <div className="flex items-center gap-2 mt-3">
+                    <button
+                      onClick={(e) => openDraftModal(lead, e)}
+                      className="text-xs px-3 py-1.5 rounded-lg bg-purple-600/20 text-purple-300 hover:bg-purple-600/30 transition"
+                    >
+                      Draft outreach
+                    </button>
+                    <button
+                      onClick={(e) => toggleFavorite(lead, e)}
+                      className="w-7 h-7 flex items-center justify-center rounded-lg bg-gray-700 hover:bg-gray-600 transition"
+                      title={favoriteIds.has(lead.business_name) ? 'Remove from favorites' : 'Add to favorites'}
+                    >
+                      <StarIcon filled={favoriteIds.has(lead.business_name)} />
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
           )}
         </div>
       </div>
+
+      {draftModalLead && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <p className="text-white font-medium text-sm">Draft outreach</p>
+                <p className="text-gray-500 text-xs mt-0.5">To: {draftModalLead.business_name}</p>
+              </div>
+              <button
+                onClick={closeDraftModal}
+                className="text-gray-500 hover:text-gray-300 transition"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {draftLoading ? (
+              <div className="py-10 flex flex-col items-center gap-3">
+                <div className="w-8 h-8 rounded-full border-2 border-gray-700 border-t-purple-500 animate-spin" />
+                <p className="text-gray-400 text-xs">Writing a draft...</p>
+              </div>
+            ) : draftError ? (
+              <p className="text-red-400 text-sm py-6">{draftError}</p>
+            ) : (
+              <>
+                <textarea
+                  value={draftText}
+                  onChange={(e) => setDraftText(e.target.value)}
+                  rows={6}
+                  className="w-full bg-gray-700 text-white rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-purple-500 resize-none mb-3"
+                />
+
+                <div className="flex items-center gap-2 mb-4">
+                  <span className={`text-xs px-2 py-0.5 rounded-full ${scoreBadgeColor(draftModalLead.score)}`}>
+                    {draftModalLead.score} lead
+                  </span>
+                  <span className="text-xs text-gray-500">{draftModalLead.score_reason}</span>
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={regenerateDraft}
+                    className="flex-1 flex items-center justify-center gap-2 bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm py-2 rounded-lg transition"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M23 4v6h-6M1 20v-6h6" />
+                      <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
+                    </svg>
+                    Regenerate
+                  </button>
+                  <button
+                    onClick={copyDraft}
+                    className="flex-1 bg-gradient-to-r from-purple-600 to-purple-500 text-white text-sm py-2 rounded-lg transition"
+                  >
+                    {copied ? 'Copied!' : 'Copy'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
